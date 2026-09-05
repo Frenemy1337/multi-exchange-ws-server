@@ -352,6 +352,10 @@ function makeBybitAdapter(wsUrl, depth, marketLabel) {
       this.ws.on('message', (raw) => {
         let msg;
         try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+        if (msg.op === 'subscribe' && msg.success === false) {
+          console.log(`Bybit ${marketLabel}: подписка отклонена — ${JSON.stringify(msg)}`);
+          return;
+        }
         if (!msg.topic || !msg.topic.startsWith('orderbook.') || !msg.data) return;
         const symbol = msg.data.s;
         const key = bookKey('bybit-' + marketLabel, 'X', symbol);
@@ -388,8 +392,8 @@ function makeBybitAdapter(wsUrl, depth, marketLabel) {
   };
 }
 
-const bybitSpot = makeBybitAdapter('wss://stream.bybit.com/v5/public/spot', 200, 'spot');
-const bybitLinear = makeBybitAdapter('wss://stream.bybit.com/v5/public/linear', 500, 'linear');
+const bybitSpot = makeBybitAdapter('wss://stream.bybit.com/v5/public/spot', 1000, 'spot');
+const bybitLinear = makeBybitAdapter('wss://stream.bybit.com/v5/public/linear', 1000, 'linear');
 
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
