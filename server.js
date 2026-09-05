@@ -568,7 +568,7 @@ const kucoinFutures = makeKuCoinAdapter(
 
 const gateFutures = {
   ws: null, subscribed: new Set(),
-  pending: new Map(), // symbol -> { buffer: [], snapshotRequested: bool }
+  lastUpdateId: new Map(), // symbol -> последний применённый u
   connect() {
     this.ws = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
     this.ws.on('open', () => {
@@ -582,55 +582,31 @@ const gateFutures = {
       if (msg.channel !== 'futures.obu' || !msg.result) return;
       const r = msg.result;
       const symbol = String(r.s || '').replace(/^ob\./, '').replace(/\.\d+$/, ''); // "ob.BTC_USDT.400" -> "BTC_USDT"
-      this.handleDelta(symbol, r);
+      const key = bookKey('gate-futures', 'X', symbol);
+      const book = ensureBook(key);
+      if (r.full) {
+        // Первое сообщение после подписки — честный полный снапшот, замена целиком (подтверждено
+        // живьём и документацией — тот же формат, что у spot.obu)
+        book.asks = new Map((r.a || []).map(([p, s]) => [p, s]));
+        book.bids = new Map((r.b || []).map(([p, s]) => [p, s]));
+        this.lastUpdateId.set(symbol, r.u);
+        book.ready = true;
+        return;
+      }
+      // Дельта — проверяем непрерывность через U относительно последнего применённого u
+      const lastId = this.lastUpdateId.get(symbol);
+      if (lastId != null && r.U > lastId + 1) {
+        console.log(`Gate futures.obu: разрыв последовательности у ${symbol}, переподписка за новым снапшотом`);
+        book.ready = false;
+        this.doSubscribe(symbol); // Gate сам пришлёт новый full-снапшот на повторную подписку
+        return;
+      }
+      applyLevels(book.asks, r.a || []);
+      applyLevels(book.bids, r.b || []);
+      this.lastUpdateId.set(symbol, r.u);
     });
     this.ws.on('close', () => { console.log('Gate futures.obu WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
     this.ws.on('error', (err) => { console.log('Gate futures.obu WS ошибка:', err.message); this.ws.close(); });
-  },
-  async fetchSnapshotAndSync(symbol, key) {
-    try {
-      const resp = await fetch(`https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=${symbol}&limit=400&with_id=true`);
-      const snap = await resp.json();
-      const book = ensureBook(key);
-      book.asks = new Map((snap.asks || []).map((lvl) => (Array.isArray(lvl) ? lvl : [lvl.p, String(lvl.s)])));
-      book.bids = new Map((snap.bids || []).map((lvl) => (Array.isArray(lvl) ? lvl : [lvl.p, String(lvl.s)])));
-      book.lastUpdateId = snap.id;
-      const pend = this.pending.get(symbol);
-      const buffered = (pend && pend.buffer) || [];
-      for (const evt of buffered) {
-        if (evt.u <= book.lastUpdateId) continue; // дельта старше снапшота — пропускаем
-        applyLevels(book.asks, evt.a || []);
-        applyLevels(book.bids, evt.b || []);
-        book.lastUpdateId = evt.u;
-      }
-      book.ready = true;
-      if (pend) pend.snapshotRequested = true;
-    } catch (err) {
-      console.log('Gate futures.obu: ошибка снапшота для', symbol, ':', err.message);
-    }
-  },
-  handleDelta(symbol, r) {
-    const key = bookKey('gate-futures', 'X', symbol);
-    const pend = this.pending.get(symbol);
-    if (!pend) return; // символ, который мы не запрашивали
-    if (!pend.snapshotRequested) {
-      pend.buffer.push(r);
-      return;
-    }
-    const book = books.get(key);
-    if (!book) return;
-    if (book.lastUpdateId != null && r.U > book.lastUpdateId + 1) {
-      console.log(`Gate futures.obu: разрыв последовательности у ${symbol}, пересинхронизация`);
-      book.ready = false;
-      pend.snapshotRequested = false;
-      pend.buffer = [r];
-      this.fetchSnapshotAndSync(symbol, key);
-      return;
-    }
-    if (r.u <= book.lastUpdateId) return; // устаревшая дельта
-    applyLevels(book.asks, r.a || []);
-    applyLevels(book.bids, r.b || []);
-    book.lastUpdateId = r.u;
   },
   doSubscribe(symbol) {
     this.subscribed.add(symbol);
@@ -645,13 +621,7 @@ const gateFutures = {
   },
   requestSymbol(symbol) {
     const key = bookKey('gate-futures', 'X', symbol);
-    if (!this.subscribed.has(symbol)) {
-      this.subscribed.add(symbol);
-      this.pending.set(symbol, { buffer: [], snapshotRequested: false });
-      ensureBook(key);
-      this.doSubscribe(symbol);
-      this.fetchSnapshotAndSync(symbol, key); // запускаем сразу, не дожидаясь дельт из стрима
-    }
+    if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
     return key;
   },
 };
