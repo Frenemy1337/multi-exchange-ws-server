@@ -546,6 +546,79 @@ const kucoinFutures = makeKuCoinAdapter(
   }
 );
 
+// ==================== АДАПТЕР: GATE.IO (только фьючи) ====================
+// Спот НЕ подключаем — новый канал spot.obu может отдавать данные в бинарном формате SBE
+// (не обычным JSON), это не подтвердить однозначно по документации, а гадать с бинарным
+// протоколом рискованно (см. также пропущенный пока MEXC с protobuf). Спот у Gate остаётся
+// на старом REST (уже работает, limit=1000 подтверждён живьём).
+// Фьючи — канал "futures.order_book_update" (ОФИЦИАЛЬНО РЕКОМЕНДОВАННЫЙ, легаси "order_book" сама
+// биржа просит не использовать). Первое сообщение после подписки — ПОЛНЫЙ снапшот (full:true),
+// дальше только дельты с U/u для сверки непрерывности — отдельный REST-запрос не нужен вообще.
+// level=300 — пробуем совпасть с уже подтверждённым максимумом REST-эндпоинта (было "limit 300"
+// в ответе биржи ранее); если канал его не примет — увидим ошибку подписки в логах Render.
+
+const gateFutures = {
+  ws: null, subscribed: new Set(), localDepthId: new Map(), // symbol -> последний применённый u
+  connect() {
+    this.ws = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
+    this.ws.on('open', () => {
+      console.log('Gate futures WS: открыто');
+      for (const symbol of this.subscribed) this.doSubscribe(symbol);
+    });
+    this.ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      if (msg.error) {
+        console.log('Gate futures: ошибка от биржи —', JSON.stringify(msg.error));
+        return;
+      }
+      if (msg.channel !== 'futures.order_book_update' || !msg.result) return;
+      const r = msg.result;
+      const symbol = r.s;
+      const key = bookKey('gate-futures', 'X', symbol);
+      const book = ensureBook(key);
+      if (r.full) {
+        // Первое сообщение после подписки (может повторяться) — полный снапшот, заменяем целиком
+        book.asks = new Map((r.a || []).map(([p, s]) => [p, s]));
+        book.bids = new Map((r.b || []).map(([p, s]) => [p, s]));
+        this.localDepthId.set(symbol, r.u);
+        book.ready = true;
+        return;
+      }
+      // Дельта — проверяем непрерывность через U (начало) относительно нашего последнего u
+      const lastId = this.localDepthId.get(symbol);
+      if (lastId != null && r.U !== lastId + 1) {
+        console.log(`Gate futures: разрыв последовательности у ${symbol}, жду новый снапшот (переподписка)`);
+        book.ready = false;
+        this.subscribed.delete(symbol); // при повторной подписке придёт свежий full-снапшот
+        this.doSubscribe(symbol);
+        return;
+      }
+      applyLevels(book.asks, r.a || []);
+      applyLevels(book.bids, r.b || []);
+      this.localDepthId.set(symbol, r.u);
+    });
+    this.ws.on('close', () => { console.log('Gate futures WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('Gate futures WS ошибка:', err.message); this.ws.close(); });
+  },
+  doSubscribe(symbol) {
+    this.subscribed.add(symbol);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        time: Math.floor(Date.now() / 1000),
+        channel: 'futures.order_book_update',
+        event: 'subscribe',
+        payload: [symbol, '100ms', '1000'], // пробуем 1000 уровней — если биржа откажет, увидим ошибку в логах
+      }));
+    }
+  },
+  requestSymbol(symbol) {
+    const key = bookKey('gate-futures', 'X', symbol);
+    if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
+    return key;
+  },
+};
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
@@ -565,6 +638,12 @@ const ADAPTERS = {
     requestSymbol: (symbol, marketType) => (marketType === 'futures' ? kucoinFutures : kucoinSpot).requestSymbol(symbol),
     connect: () => { kucoinSpot.connect(); kucoinFutures.connect(); },
     wsStateReport: () => ({ spot: kucoinSpot.ws ? kucoinSpot.ws.readyState : 'not connected', futures: kucoinFutures.ws ? kucoinFutures.ws.readyState : 'not connected' }),
+  },
+  // Только фьючи — спот Gate остаётся на REST (см. комментарий у gateFutures про бинарный SBE-риск)
+  gate: {
+    requestSymbol: (symbol) => gateFutures.requestSymbol(symbol), // marketType не нужен — сюда попадают только фьючерсные запросы
+    connect: () => gateFutures.connect(),
+    wsStateReport: () => ({ futures: gateFutures.ws ? gateFutures.ws.readyState : 'not connected', spot: 'не подключено (остаётся на REST)' }),
   },
 };
 
