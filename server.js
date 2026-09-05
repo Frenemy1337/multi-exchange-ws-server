@@ -1030,6 +1030,17 @@ const mexcDiagnostic = {
       if (typeof raw === 'string' || raw.length < 5) return; // служебный текстовый ответ, не бинарные данные
       try {
         const fields = decodeProtobuf(raw);
+        // Верхний уровень — ищем поле с именем символа (строка "BTCUSDT" где-то в length-delimited полях)
+        for (const fieldNum of Object.keys(fields)) {
+          for (const entry of fields[fieldNum]) {
+            if (entry.wireType === 2 && Buffer.isBuffer(entry.value)) {
+              const asText = entry.value.toString('utf8');
+              if (/^[A-Za-z0-9._@]+$/.test(asText) && asText.length < 100) {
+                console.log(`MEXC obu-диагностика: верхнее поле ${fieldNum} — похоже на текст: "${asText}"`);
+              }
+            }
+          }
+        }
         const candidates = findPriceQtyLists(fields);
         console.log('MEXC obu-диагностика: найдено кандидатов на bids/asks:', candidates.length);
         candidates.forEach((c) => console.log('  путь', c.path.join('.'), '— записей:', c.count, '— пример:', JSON.stringify(c.sample)));
