@@ -694,7 +694,8 @@ const kraken = {
 };
 
 // ==================== АДАПТЕР: HTX (Huobi) ====================
-// wss://api-aws.huobi.pro/ws, канал market.{symbol}.mbp.400 (актуальный с 2021, было mbp.150).
+// wss://api-aws.huobi.pro/ws, канал market.{symbol}.mbp.150 — mbp.400 биржа явно отклонила как
+// невалидный топик ("invalid topic"), 150 — подтверждённо рабочее значение из документации.
 // ВСЕ входящие сообщения — GZIP бинарные, нужно распаковывать перед JSON.parse. Свой пинг/понг
 // текстом, без сжатия. Сам канал отдаёт только дельты — нужен отдельный "req" запрос за снапшотом
 // с seqNum, дальше сверка по prevSeqNum (та же идея, что у Binance/KuCoin).
@@ -780,7 +781,7 @@ const htx = {
   doSubscribeAndRequest(symbol) {
     this.subscribed.add(symbol);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const topic = `market.${symbol}.mbp.400`;
+      const topic = `market.${symbol}.mbp.150`; // mbp.400 отклонён биржой как invalid topic — используем 150
       this.ws.send(JSON.stringify({ sub: topic, id: String(this.nextId++) }));
       this.ws.send(JSON.stringify({ req: topic, id: String(this.nextId++) }));
     }
@@ -882,7 +883,7 @@ const ADAPTERS = {
     wsStateReport: () => ({ futures: gateFutures.ws ? gateFutures.ws.readyState : 'not connected' }),
   },
   kraken,
-  // HTX — спот (mbp.400) и фьючи (depth.size_150.high_freq) на РАЗНЫХ доменах/соединениях
+  // HTX — спот (mbp.150) и фьючи (depth.size_150.high_freq) на РАЗНЫХ доменах/соединениях
   htx: {
     requestSymbol: (symbol, marketType) => (marketType === 'futures' ? htxFutures : htx).requestSymbol(symbol),
     connect: () => { htx.connect(); htxFutures.connect(); },
