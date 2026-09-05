@@ -608,7 +608,8 @@ const gateFutures = {
         time: Math.floor(Date.now() / 1000),
         channel: 'futures.order_book_update',
         event: 'subscribe',
-        payload: [symbol, '100ms', '350'], // пробуем 350 — вдруг валидный шаг между 300 и 400
+        payload: [symbol, '100ms', '300'], // 350/400/500/1000 биржа отклонила — 300 подтверждённо
+        // рабочее значение (совпадает с максимумом REST), финально останавливаюсь на нём
       }));
     }
   },
