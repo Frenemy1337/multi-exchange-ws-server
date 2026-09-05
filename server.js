@@ -53,6 +53,22 @@ function applyLevels(map, levels) {
     else map.set(priceStr, sizeStr);
   }
 }
+// Та же логика, но с доп. защитой от "мусорных" уровней — используется ТОЛЬКО там, где реально
+// наблюдали проблему (KuCoin), а не на всех биржах разом: у некоторых токенов (мемкоины с огромным
+// количеством в обращении) 12+-значные ЦЕЛЫЕ объёмы — это реальные легитимные ордера, не мусор,
+// поэтому глобально такой фильтр ставить рискованно — можно случайно отбросить настоящие данные.
+function applyLevelsGuarded(map, levels) {
+  if (!Array.isArray(levels)) return;
+  for (const lvl of levels) {
+    if (!Array.isArray(lvl) || lvl.length < 2) continue;
+    const [priceStr, sizeStr] = lvl;
+    // Подтверждённый живой случай: у KuCoin однажды пришло "14054264681444" вместо нормального
+    // объёма (по величине похоже на sequence ID, а не на размер сделки) — отбрасываем такие уровни.
+    if (/^\d{12,}$/.test(String(sizeStr))) continue;
+    if (Number(sizeStr) === 0) map.delete(priceStr);
+    else map.set(priceStr, sizeStr);
+  }
+}
 function mapToSortedArray(map, ascending) {
   return Array.from(map.entries())
     .sort((a, b) => (ascending ? Number(a[0]) - Number(b[0]) : Number(b[0]) - Number(a[0])))
@@ -424,7 +440,7 @@ function kucoinSignedFetch(pathAndQuery) {
   });
 }
 
-function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher) {
+function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher, normalizeUpdate) {
   return {
     ws: null, pingTimer: null, nextId: 1, subscribed: new Set(),
     pending: new Map(), // symbol -> { buffer: [], snapshotRequested: bool }
@@ -481,10 +497,11 @@ function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher) 
         book.sequence = Number(d.sequence != null ? d.sequence : d.sequenceEnd || 0);
         const pend = this.pending.get(symbol);
         const buffered = (pend && pend.buffer) || [];
-        for (const evt of buffered) {
+        for (const rawEvt of buffered) {
+          const evt = normalizeUpdate(rawEvt);
           if (evt.sequenceEnd <= book.sequence) continue; // событие старше снапшота
-          applyLevels(book.asks, (evt.changes && evt.changes.asks) || []);
-          applyLevels(book.bids, (evt.changes && evt.changes.bids) || []);
+          applyLevelsGuarded(book.asks, evt.asksChanges);
+          applyLevelsGuarded(book.bids, evt.bidsChanges);
           book.sequence = evt.sequenceEnd;
         }
         book.ready = true;
@@ -498,25 +515,26 @@ function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher) 
       const key = bookKey('kucoin-' + marketLabel, 'X', symbol);
       const pend = this.pending.get(symbol);
       if (!pend) return; // символ, который мы не запрашивали
-      const d = msg.data;
+      const rawData = msg.data;
       if (!pend.snapshotRequested) {
-        pend.buffer.push(d);
+        pend.buffer.push(rawData);
         return;
       }
       const book = books.get(key);
       if (!book) return;
-      if (d.sequenceStart > book.sequence + 1) {
+      const evt = normalizeUpdate(rawData);
+      if (evt.sequenceStart > book.sequence + 1) {
         console.log(`KuCoin ${marketLabel}: разрыв последовательности у ${symbol}, пересинхронизация`);
         book.ready = false;
         pend.snapshotRequested = false;
-        pend.buffer = [d];
+        pend.buffer = [rawData];
         this.fetchSnapshotAndSync(symbol, key);
         return;
       }
-      if (d.sequenceEnd <= book.sequence) return; // устаревшее событие, игнорируем
-      applyLevels(book.asks, (d.changes && d.changes.asks) || []);
-      applyLevels(book.bids, (d.changes && d.changes.bids) || []);
-      book.sequence = d.sequenceEnd;
+      if (evt.sequenceEnd <= book.sequence) return; // устаревшее событие, игнорируем
+      applyLevelsGuarded(book.asks, evt.asksChanges);
+      applyLevelsGuarded(book.bids, evt.bidsChanges);
+      book.sequence = evt.sequenceEnd;
     },
     requestSymbol(symbol) {
       const key = bookKey('kucoin-' + marketLabel, 'X', symbol);
@@ -532,6 +550,29 @@ function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher) 
   };
 }
 
+// Спот: сообщение уже в удобном виде — {changes:{asks,bids}, sequenceStart, sequenceEnd}
+function kucoinSpotNormalize(d) {
+  return {
+    sequenceStart: d.sequenceStart, sequenceEnd: d.sequenceEnd,
+    asksChanges: (d.changes && d.changes.asks) || [],
+    bidsChanges: (d.changes && d.changes.bids) || [],
+  };
+}
+// Фьючи: СОВСЕМ другой формат — {sequence, change: "цена,sторона,объём"} — одна строка на одно
+// изменение, не массив. side="sell" -> ask, side="buy" -> bid. sequence — одиночное число, не
+// диапазон start/end, так что используем его и как start, и как end для проверки непрерывности.
+function kucoinFuturesNormalize(d) {
+  const parts = String(d.change || '').split(',');
+  const price = parts[0], side = parts[1], size = parts[2];
+  const seq = d.sequence;
+  const level = [price, size];
+  return {
+    sequenceStart: seq, sequenceEnd: seq,
+    asksChanges: side === 'sell' ? [level] : [],
+    bidsChanges: side === 'buy' ? [level] : [],
+  };
+}
+
 const kucoinSpot = makeKuCoinAdapter(
   'https://api.kucoin.com/api/v1/bullet-public',
   '/market/level2:',
@@ -539,7 +580,8 @@ const kucoinSpot = makeKuCoinAdapter(
   async (symbol) => {
     const resp = await kucoinSignedFetch(`/api/v3/market/orderbook/level2?symbol=${symbol}`);
     return resp.json();
-  }
+  },
+  kucoinSpotNormalize
 );
 const kucoinFutures = makeKuCoinAdapter(
   'https://api-futures.kucoin.com/api/v1/bullet-public',
@@ -548,7 +590,8 @@ const kucoinFutures = makeKuCoinAdapter(
   async (symbol) => {
     const resp = await fetch(`https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol=${symbol}`);
     return resp.json();
-  }
+  },
+  kucoinFuturesNormalize
 );
 
 // ==================== GATE.IO — И СПОТ, И ФЬЮЧИ ЧЕРЕЗ REST-ПРОБРОС ====================
