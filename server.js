@@ -43,7 +43,11 @@ function ensureBook(key) {
   return books.get(key);
 }
 function applyLevels(map, levels) {
-  for (const [priceStr, sizeStr] of levels) {
+  if (!Array.isArray(levels)) return; // защита: неожиданный формат от биржи — просто пропускаем,
+  // не роняем общий сервер (на нём висят ВСЕ 11 бирж, одно кривое сообщение не должно валить всё)
+  for (const lvl of levels) {
+    if (!Array.isArray(lvl) || lvl.length < 2) continue;
+    const [priceStr, sizeStr] = lvl;
     if (Number(sizeStr) === 0) map.delete(priceStr);
     else map.set(priceStr, sizeStr);
   }
@@ -695,6 +699,16 @@ app.get('/', (req, res) => {
     })),
     subscribedCount: books.size,
   });
+});
+
+// Общая страховка: сервер один на ВСЕ 11 бирж — если где-то в обработке сообщения от ОДНОЙ биржи
+// вылезет неожиданная ошибка (неизвестный формат данных и т.п.), процесс не должен падать целиком
+// и утаскивать за собой соединения остальных десяти. Логируем и продолжаем работать.
+process.on('uncaughtException', (err) => {
+  console.log('НЕПОЙМАННОЕ ИСКЛЮЧЕНИЕ (сервер продолжает работать):', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.log('НЕОБРАБОТАННЫЙ REJECT (сервер продолжает работать):', err && err.message);
 });
 
 const PORT = process.env.PORT || 3000;
