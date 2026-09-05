@@ -608,7 +608,7 @@ const gateFutures = {
         time: Math.floor(Date.now() / 1000),
         channel: 'futures.order_book_update',
         event: 'subscribe',
-        payload: [symbol, '100ms', '1000'], // пробуем 1000 уровней — если биржа откажет, увидим ошибку в логах
+        payload: [symbol, '100ms', '500'], // 1000 биржа явно отклонила ("provided level not supported: 1000") — пробуем 500
       }));
     }
   },
