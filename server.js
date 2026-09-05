@@ -28,6 +28,7 @@
 const express = require('express');
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const zlib = require('zlib'); // встроен в Node — для GZIP-сообщений HTX, доп. пакет не нужен
 const app = express();
 
 // ==================== ОБЩИЕ УТИЛИТЫ (одни на все биржи) ====================
@@ -692,6 +693,168 @@ const kraken = {
   },
 };
 
+// ==================== АДАПТЕР: HTX (Huobi) ====================
+// wss://api-aws.huobi.pro/ws, канал market.{symbol}.mbp.400 (актуальный с 2021, было mbp.150).
+// ВСЕ входящие сообщения — GZIP бинарные, нужно распаковывать перед JSON.parse. Свой пинг/понг
+// текстом, без сжатия. Сам канал отдаёт только дельты — нужен отдельный "req" запрос за снапшотом
+// с seqNum, дальше сверка по prevSeqNum (та же идея, что у Binance/KuCoin).
+
+const htx = {
+  ws: null, nextId: 1, subscribed: new Set(),
+  pending: new Map(), // symbol -> { buffer: [], snapshotRequested: bool }
+  connect() {
+    this.ws = new WebSocket('wss://api-aws.huobi.pro/ws');
+    this.ws.on('open', () => {
+      console.log('HTX WS: открыто');
+      for (const symbol of this.subscribed) this.doSubscribeAndRequest(symbol);
+    });
+    this.ws.on('message', (raw) => {
+      let text;
+      try { text = zlib.gunzipSync(raw).toString('utf8'); } catch (e) { return; } // не гружёный gzip — игнор
+      let msg;
+      try { msg = JSON.parse(text); } catch (e) { return; }
+      if (msg.ping) {
+        this.ws.send(JSON.stringify({ pong: msg.ping })); // обычным текстом, без gzip
+        return;
+      }
+      if (msg.status === 'error') {
+        console.log('HTX: ошибка от биржи —', JSON.stringify(msg));
+        return;
+      }
+      if (msg.rep) {
+        // Ответ на "req" — снапшот с seqNum
+        const symbol = msg.rep.replace(/^market\./, '').replace(/\.mbp\.\d+$/, '');
+        this.applySnapshot(symbol, msg.data);
+        return;
+      }
+      if (msg.ch) {
+        // Push-обновление (дельта)
+        const symbol = msg.ch.replace(/^market\./, '').replace(/\.mbp\.\d+$/, '');
+        this.handleDelta(symbol, msg.tick);
+      }
+    });
+    this.ws.on('close', () => { console.log('HTX WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('HTX WS ошибка:', err.message); this.ws.close(); });
+  },
+  applySnapshot(symbol, data) {
+    if (!data) return;
+    const key = bookKey('htx', 'X', symbol);
+    const book = ensureBook(key);
+    book.asks = new Map((data.asks || []).map(([p, s]) => [String(p), String(s)]));
+    book.bids = new Map((data.bids || []).map(([p, s]) => [String(p), String(s)]));
+    book.lastSeqNum = data.seqNum;
+    const pend = this.pending.get(symbol);
+    const buffered = (pend && pend.buffer) || [];
+    for (const tick of buffered) {
+      if (tick.prevSeqNum != null && tick.prevSeqNum < book.lastSeqNum) continue; // дельта старше снапшота
+      applyLevels(book.asks, tick.asks || []);
+      applyLevels(book.bids, tick.bids || []);
+      book.lastSeqNum = tick.seqNum;
+    }
+    book.ready = true;
+    if (pend) pend.snapshotRequested = true;
+  },
+  handleDelta(symbol, tick) {
+    if (!tick) return;
+    const key = bookKey('htx', 'X', symbol);
+    const pend = this.pending.get(symbol);
+    if (!pend) return; // символ, который мы не запрашивали
+    if (!pend.snapshotRequested) {
+      pend.buffer.push(tick);
+      return;
+    }
+    const book = books.get(key);
+    if (!book) return;
+    if (book.lastSeqNum != null && tick.prevSeqNum !== book.lastSeqNum) {
+      console.log(`HTX: разрыв последовательности у ${symbol}, переподписка за новым снапшотом`);
+      book.ready = false;
+      pend.snapshotRequested = false;
+      pend.buffer = [];
+      this.doSubscribeAndRequest(symbol);
+      return;
+    }
+    applyLevels(book.asks, tick.asks || []);
+    applyLevels(book.bids, tick.bids || []);
+    book.lastSeqNum = tick.seqNum;
+  },
+  doSubscribeAndRequest(symbol) {
+    this.subscribed.add(symbol);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const topic = `market.${symbol}.mbp.400`;
+      this.ws.send(JSON.stringify({ sub: topic, id: String(this.nextId++) }));
+      this.ws.send(JSON.stringify({ req: topic, id: String(this.nextId++) }));
+    }
+  },
+  requestSymbol(symbol) {
+    const lower = symbol.toLowerCase(); // HTX использует строчные тикеры (btcusdt, не BTCUSDT)
+    const key = bookKey('htx', 'X', lower);
+    if (!this.subscribed.has(lower)) {
+      this.pending.set(lower, { buffer: [], snapshotRequested: false });
+      ensureBook(key);
+      this.doSubscribeAndRequest(lower);
+    }
+    return key;
+  },
+};
+
+// ==================== АДАПТЕР: HTX ФЬЮЧИ (USDT-маржинальные свопы) ====================
+// Отдельный домен (linear-swap-ws, не обычный /ws!) и отдельный канал (depth.size_150.high_freq,
+// не mbp). Тот же GZIP, но проще по сверке — первое сообщение после подписки уже полный снапшот
+// (документация: "when data_type is incremental, snapshot data will be pushed for the first time"),
+// дальше просто дельты — без отдельного "req" запроса, в отличие от спота.
+
+const htxFutures = {
+  ws: null, nextId: 1, subscribed: new Set(),
+  connect() {
+    this.ws = new WebSocket('wss://api.hbdm.com/linear-swap-ws');
+    this.ws.on('open', () => {
+      console.log('HTX futures WS: открыто');
+      for (const symbol of this.subscribed) this.doSubscribe(symbol);
+    });
+    this.ws.on('message', (raw) => {
+      let text;
+      try { text = zlib.gunzipSync(raw).toString('utf8'); } catch (e) { return; }
+      let msg;
+      try { msg = JSON.parse(text); } catch (e) { return; }
+      if (msg.ping) { this.ws.send(JSON.stringify({ pong: msg.ping })); return; }
+      if (msg.status === 'error') { console.log('HTX futures: ошибка от биржи —', JSON.stringify(msg)); return; }
+      if (!msg.ch || !msg.tick) return;
+      const symbol = msg.ch.replace(/^market\./, '').replace(/\.depth\.size_150\.high_freq$/, '');
+      const key = bookKey('htx-futures', 'X', symbol);
+      const book = ensureBook(key);
+      const isFirstMessage = !book.ready; // первое сообщение после подписки — полный снапшот
+      if (isFirstMessage) {
+        book.asks = new Map((msg.tick.asks || []).map(([p, s]) => [String(p), String(s)]));
+        book.bids = new Map((msg.tick.bids || []).map(([p, s]) => [String(p), String(s)]));
+        book.ready = true;
+      } else {
+        applyLevels(book.asks, msg.tick.asks || []);
+        applyLevels(book.bids, msg.tick.bids || []);
+      }
+    });
+    this.ws.on('close', () => { console.log('HTX futures WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('HTX futures WS ошибка:', err.message); this.ws.close(); });
+  },
+  doSubscribe(symbol) {
+    this.subscribed.add(symbol);
+    const key = bookKey('htx-futures', 'X', symbol);
+    const book = books.get(key);
+    if (book) book.ready = false; // следующее сообщение после (пере)подписки — снапшот, не дельта
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        sub: `market.${symbol}.depth.size_150.high_freq`,
+        id: String(this.nextId++),
+        data_type: 'incremental',
+      }));
+    }
+  },
+  requestSymbol(symbol) {
+    const key = bookKey('htx-futures', 'X', symbol);
+    if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
+    return key;
+  },
+};
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
@@ -719,6 +882,12 @@ const ADAPTERS = {
     wsStateReport: () => ({ futures: gateFutures.ws ? gateFutures.ws.readyState : 'not connected' }),
   },
   kraken,
+  // HTX — спот (mbp.400) и фьючи (depth.size_150.high_freq) на РАЗНЫХ доменах/соединениях
+  htx: {
+    requestSymbol: (symbol, marketType) => (marketType === 'futures' ? htxFutures : htx).requestSymbol(symbol),
+    connect: () => { htx.connect(); htxFutures.connect(); },
+    wsStateReport: () => ({ spot: htx.ws ? htx.ws.readyState : 'not connected', futures: htxFutures.ws ? htxFutures.ws.readyState : 'not connected' }),
+  },
 };
 
 // Ждёт, пока стакан по ключу станет готов (пришёл снапшот) — вместо того чтобы сразу сдаваться.
