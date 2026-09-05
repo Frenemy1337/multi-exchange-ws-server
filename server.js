@@ -626,6 +626,71 @@ const gateFutures = {
   },
 };
 
+// ==================== АДАПТЕР: KRAKEN ====================
+// wss://ws.kraken.com/v2, канал "book", depth=1000 (подтверждённый максимум: 10/25/100/500/1000).
+// Важно: v2 использует символы вида "BTC/USD" (со слэшем, БЕЗ переименования в XBT — это было
+// только у старого REST API v0/v1!). Наш склеенный тикер вида "XBTUSD" нужно разобрать обратно на
+// базу+валюту и превратить XBT снова в BTC — делаем это тем же приёмом "отрезать известный хвост
+// валюты", что и в Apps Script для остальных бирж.
+const KRAKEN_QUOTE_SUFFIXES = ['USDT', 'USDC', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'CHF', 'USD'];
+function krakenSymbolToPair(symbol) {
+  const s = symbol.toUpperCase();
+  for (const q of KRAKEN_QUOTE_SUFFIXES) {
+    if (s.endsWith(q) && s.length > q.length) {
+      let base = s.slice(0, s.length - q.length);
+      if (base === 'XBT') base = 'BTC'; // v2 зовёт BTC его настоящим именем, не XBT
+      return `${base}/${q}`;
+    }
+  }
+  return symbol; // не смогли разобрать — пробуем как есть
+}
+
+const kraken = {
+  ws: null, subscribed: new Set(),
+  connect() {
+    this.ws = new WebSocket('wss://ws.kraken.com/v2');
+    this.ws.on('open', () => {
+      console.log('Kraken WS: открыто');
+      for (const symbol of this.subscribed) this.doSubscribe(symbol);
+    });
+    this.ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      if (msg.channel !== 'book' || !msg.data) return;
+      const d = msg.data[0];
+      if (!d) return;
+      // Обратно превращаем "BTC/USD" в наш внутренний ключ формата "XBTUSD" (симметрично krakenSymbolToPair)
+      const [base, quote] = d.symbol.split('/');
+      const internalSymbol = (base === 'BTC' ? 'XBT' : base) + quote;
+      const key = bookKey('kraken', 'X', internalSymbol);
+      const book = ensureBook(key);
+      if (msg.type === 'snapshot') {
+        book.asks = new Map((d.asks || []).map((lvl) => [String(lvl.price), String(lvl.qty)]));
+        book.bids = new Map((d.bids || []).map((lvl) => [String(lvl.price), String(lvl.qty)]));
+        book.ready = true;
+      } else if (msg.type === 'update') {
+        applyLevels(book.asks, (d.asks || []).map((lvl) => [String(lvl.price), String(lvl.qty)]));
+        applyLevels(book.bids, (d.bids || []).map((lvl) => [String(lvl.price), String(lvl.qty)]));
+      }
+    });
+    this.ws.on('close', () => { console.log('Kraken WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('Kraken WS ошибка:', err.message); this.ws.close(); });
+  },
+  doSubscribe(symbol) {
+    this.subscribed.add(symbol);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        method: 'subscribe',
+        params: { channel: 'book', symbol: [krakenSymbolToPair(symbol)], depth: 1000 },
+      }));
+    }
+  },
+  requestSymbol(symbol) {
+    const key = bookKey('kraken', 'X', symbol);
+    if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
+    return key;
+  },
+};
 
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
@@ -653,6 +718,7 @@ const ADAPTERS = {
     connect: () => gateFutures.connect(),
     wsStateReport: () => ({ futures: gateFutures.ws ? gateFutures.ws.readyState : 'not connected' }),
   },
+  kraken,
 };
 
 // Ждёт, пока стакан по ключу станет готов (пришёл снапшот) — вместо того чтобы сразу сдаваться.
