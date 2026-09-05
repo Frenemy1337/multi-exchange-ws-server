@@ -282,15 +282,129 @@ const binanceFutures = makeBinanceAdapter(
   'futures'
 );
 
+// ==================== АДАПТЕР: OKX ====================
+// wss://ws.okx.com:8443/ws/v5/public, канал "books" (снапшот+дельты), ping "ping"/20с ждём "pong"
+
+const okx = {
+  ws: null, pingTimer: null, subscribed: new Set(),
+  connect() {
+    this.ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
+    this.ws.on('open', () => {
+      console.log('OKX WS: открыто');
+      for (const instId of this.subscribed) this.doSubscribe(instId);
+      this.startPing();
+    });
+    this.ws.on('message', (raw) => {
+      const text = raw.toString();
+      if (text === 'pong') return;
+      let msg;
+      try { msg = JSON.parse(text); } catch (e) { return; }
+      if (!msg.arg || msg.arg.channel !== 'books' || !msg.data) return;
+      const key = bookKey('okx', 'X', msg.arg.instId);
+      const book = ensureBook(key);
+      const data = msg.data[0] || {};
+      if (msg.action === 'snapshot') {
+        book.asks = new Map((data.asks || []).map(([p, s]) => [p, s]));
+        book.bids = new Map((data.bids || []).map(([p, s]) => [p, s]));
+        book.ready = true;
+      } else if (msg.action === 'update') {
+        applyLevels(book.asks, data.asks || []);
+        applyLevels(book.bids, data.bids || []);
+      }
+    });
+    this.ws.on('close', () => { console.log('OKX WS: закрыто, переподключаюсь'); clearInterval(this.pingTimer); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('OKX WS ошибка:', err.message); this.ws.close(); });
+  },
+  startPing() {
+    clearInterval(this.pingTimer);
+    this.pingTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send('ping');
+    }, 20000);
+  },
+  doSubscribe(instId) {
+    this.subscribed.add(instId);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'books', instId }] }));
+    }
+  },
+  requestSymbol(symbol) {
+    const key = bookKey('okx', 'X', symbol);
+    if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
+    return key;
+  },
+};
+
+// ==================== АДАПТЕР: BYBIT ====================
+// Отдельные соединения на спот и линейные фьючи. Топик orderbook.{depth}.{symbol} — берём
+// максимальную документированную глубину (200 спот, 500 линейные). ЛЮБОЕ сообщение type="snapshot"
+// (не только первое!) должно ПОЛНОСТЬЮ сбрасывать локальную книгу — так по официальным доксам.
+
+function makeBybitAdapter(wsUrl, depth, marketLabel) {
+  return {
+    ws: null, pingTimer: null, subscribed: new Set(),
+    connect() {
+      this.ws = new WebSocket(wsUrl);
+      this.ws.on('open', () => {
+        console.log(`Bybit ${marketLabel} WS: открыто`);
+        for (const symbol of this.subscribed) this.doSubscribe(symbol);
+        this.startPing();
+      });
+      this.ws.on('message', (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+        if (!msg.topic || !msg.topic.startsWith('orderbook.') || !msg.data) return;
+        const symbol = msg.data.s;
+        const key = bookKey('bybit-' + marketLabel, 'X', symbol);
+        const book = ensureBook(key);
+        if (msg.type === 'snapshot') {
+          book.asks = new Map((msg.data.a || []).map(([p, s]) => [p, s]));
+          book.bids = new Map((msg.data.b || []).map(([p, s]) => [p, s]));
+          book.ready = true;
+        } else if (msg.type === 'delta') {
+          applyLevels(book.asks, msg.data.a || []);
+          applyLevels(book.bids, msg.data.b || []);
+        }
+      });
+      this.ws.on('close', () => { console.log(`Bybit ${marketLabel} WS: закрыто, переподключаюсь`); clearInterval(this.pingTimer); setTimeout(() => this.connect(), 3000); });
+      this.ws.on('error', (err) => { console.log(`Bybit ${marketLabel} WS ошибка:`, err.message); this.ws.close(); });
+    },
+    startPing() {
+      clearInterval(this.pingTimer);
+      this.pingTimer = setInterval(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ op: 'ping' }));
+      }, 20000);
+    },
+    doSubscribe(symbol) {
+      this.subscribed.add(symbol);
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ op: 'subscribe', args: [`orderbook.${depth}.${symbol}`] }));
+      }
+    },
+    requestSymbol(symbol) {
+      const key = bookKey('bybit-' + marketLabel, 'X', symbol);
+      if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
+      return key;
+    },
+  };
+}
+
+const bybitSpot = makeBybitAdapter('wss://stream.bybit.com/v5/public/spot', 200, 'spot');
+const bybitLinear = makeBybitAdapter('wss://stream.bybit.com/v5/public/linear', 500, 'linear');
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
-  bitget, whitebit,
+  bitget, whitebit, okx,
   binance: {
     requestSymbol: (symbol, marketType) => (marketType === 'futures' ? binanceFutures : binanceSpot).requestSymbol(symbol),
     connect: () => { binanceSpot.connect(); binanceFutures.connect(); },
     // У Binance два реальных соединения (спот+фьючи) под одной записью в ADAPTERS — отдаём оба состояния
     wsStateReport: () => ({ spot: binanceSpot.ws ? binanceSpot.ws.readyState : 'not connected', futures: binanceFutures.ws ? binanceFutures.ws.readyState : 'not connected' }),
+  },
+  bybit: {
+    requestSymbol: (symbol, marketType) => (marketType === 'futures' ? bybitLinear : bybitSpot).requestSymbol(symbol),
+    connect: () => { bybitSpot.connect(); bybitLinear.connect(); },
+    wsStateReport: () => ({ spot: bybitSpot.ws ? bybitSpot.ws.readyState : 'not connected', linear: bybitLinear.ws ? bybitLinear.ws.readyState : 'not connected' }),
   },
 };
 
