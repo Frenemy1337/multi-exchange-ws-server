@@ -171,7 +171,22 @@ const whitebit = {
 
 const ADAPTERS = { bitget, whitebit };
 
-app.get('/depth', (req, res) => {
+// Ждёт, пока стакан по ключу станет готов (пришёл снапшот) — вместо того чтобы сразу сдаваться.
+// На практике снапшот приходит за 1-2 секунды после подписки; 8 секунд — комфортный запас сверху.
+function waitForReady(key, timeoutMs = 8000, intervalMs = 200) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const check = () => {
+      const book = books.get(key);
+      if (book && book.ready) return resolve(book);
+      if (Date.now() - start >= timeoutMs) return resolve(null);
+      setTimeout(check, intervalMs);
+    };
+    check();
+  });
+}
+
+app.get('/depth', async (req, res) => {
   const exchange = req.query.exchange;
   const symbol = req.query.symbol;
   const marketType = req.query.marketType === 'futures' ? 'futures' : 'spot';
@@ -181,9 +196,14 @@ app.get('/depth', (req, res) => {
   if (!adapter) return res.status(400).json({ error: `Биржа "${exchange}" пока не подключена к WS-серверу` });
 
   const key = adapter.requestSymbol(symbol, marketType);
-  const book = books.get(key);
+  let book = books.get(key);
   if (!book || !book.ready) {
-    return res.status(202).json({ status: 'warming_up', message: 'Подписался/жду снапшот, подожди пару секунд и запроси снова' });
+    // Не сдаёмся сразу — ждём немного прихода снапшота, чтобы клиенту не приходилось жать
+    // "обновить" второй раз вручную ради того, что обычно занимает секунду-две.
+    book = await waitForReady(key);
+  }
+  if (!book || !book.ready) {
+    return res.status(202).json({ status: 'warming_up', message: 'Не дождался снапшота за 8 секунд, подожди ещё и запроси снова' });
   }
   res.json({ asks: mapToSortedArray(book.asks, true), bids: mapToSortedArray(book.bids, false) });
 });
