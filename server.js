@@ -856,6 +856,77 @@ const htxFutures = {
   },
 };
 
+// ==================== АДАПТЕР: BITFINEX ====================
+// wss://api-pub.bitfinex.com/ws/2, канал "book", precision P0 (без агрегации), len=250 (макс.
+// документированная глубина). ВАЖНО: после подписки все сообщения приходят только с числовым
+// chanId, без имени символа — нужно самим сопоставлять chanId -> символ.
+// Формат уровня [цена, count, объём]: объём>0 — бид, объём<0 — аск, count=0 — убрать уровень.
+
+const bitfinex = {
+  ws: null, subscribed: new Set(), chanToSymbol: new Map(), // chanId -> наш внутренний символ
+  connect() {
+    this.ws = new WebSocket('wss://api-pub.bitfinex.com/ws/2');
+    this.ws.on('open', () => {
+      console.log('Bitfinex WS: открыто');
+      for (const symbol of this.subscribed) this.doSubscribe(symbol);
+    });
+    this.ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      if (!Array.isArray(msg)) {
+        // Служебное событие (subscribed/error/info) — по нему запоминаем chanId -> символ
+        if (msg.event === 'subscribed' && msg.channel === 'book') {
+          this.chanToSymbol.set(msg.chanId, this.tSymbolToInternal(msg.symbol));
+        } else if (msg.event === 'error') {
+          console.log('Bitfinex: ошибка от биржи —', JSON.stringify(msg));
+        }
+        return;
+      }
+      const [chanId, payload] = msg;
+      if (payload === 'hb') return; // heartbeat, игнорируем
+      const symbol = this.chanToSymbol.get(chanId);
+      if (!symbol) return;
+      const key = bookKey('bitfinex', 'X', symbol);
+      const book = ensureBook(key);
+      const applyOne = ([price, count, amount]) => {
+        const map = amount > 0 ? book.bids : book.asks;
+        const priceStr = String(price);
+        if (count === 0) map.delete(priceStr);
+        else map.set(priceStr, String(Math.abs(amount)));
+      };
+      if (Array.isArray(payload[0])) {
+        // Снапшот — массив уровней целиком, заменяем книгу
+        book.asks = new Map();
+        book.bids = new Map();
+        payload.forEach(applyOne);
+        book.ready = true;
+      } else {
+        // Обновление — один уровень
+        applyOne(payload);
+      }
+    });
+    this.ws.on('close', () => { console.log('Bitfinex WS: закрыто, переподключаюсь'); this.chanToSymbol.clear(); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('Bitfinex WS ошибка:', err.message); this.ws.close(); });
+  },
+  // Наш внутренний символ ("ADAUSD", "BTCF0:USTF0") -> формат биржи с префиксом "t" ("tADAUSD")
+  internalToTSymbol(symbol) { return 't' + symbol; },
+  tSymbolToInternal(tSymbol) { return tSymbol.replace(/^t/, ''); },
+  doSubscribe(symbol) {
+    this.subscribed.add(symbol);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        event: 'subscribe', channel: 'book',
+        symbol: this.internalToTSymbol(symbol), prec: 'P0', len: '250',
+      }));
+    }
+  },
+  requestSymbol(symbol) {
+    const key = bookKey('bitfinex', 'X', symbol);
+    if (!this.subscribed.has(symbol)) this.doSubscribe(symbol);
+    return key;
+  },
+};
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
@@ -889,6 +960,7 @@ const ADAPTERS = {
     connect: () => { htx.connect(); htxFutures.connect(); },
     wsStateReport: () => ({ spot: htx.ws ? htx.ws.readyState : 'not connected', futures: htxFutures.ws ? htxFutures.ws.readyState : 'not connected' }),
   },
+  bitfinex,
 };
 
 // Ждёт, пока стакан по ключу станет готов (пришёл снапшот) — вместо того чтобы сразу сдаваться.
