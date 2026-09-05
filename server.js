@@ -167,9 +167,132 @@ const whitebit = {
   },
 };
 
+// ==================== АДАПТЕР: BINANCE ====================
+// Самый сложный протокол из всех: WS-стрим отдаёт только ДЕЛЬТЫ, полного снапшота там нет.
+// Официальный алгоритм: буферизируем дельты, параллельно берём REST-снапшот с lastUpdateId,
+// отбрасываем дельты старше снапшота, дальше проверяем непрерывность (U нового = u+1 предыдущего).
+// Отдельные WS-соединения на спот и USDT-фьючи (разные домены), подписка сообщением SUBSCRIBE —
+// так можно подписываться на лету без переподключения, как и у остальных адаптеров.
+
+function makeBinanceAdapter(wsBase, restSnapshotUrl, marketLabel) {
+  return {
+    ws: null, nextId: 1, subscribed: new Set(),
+    pending: new Map(), // symbol(lowercase) -> { buffer: [], snapshotRequested: bool }
+    connect() {
+      this.ws = new WebSocket(wsBase);
+      this.ws.on('open', () => {
+        console.log(`Binance ${marketLabel} WS: открыто`);
+        for (const sym of this.subscribed) this.sendSubscribe(sym);
+      });
+      this.ws.on('message', (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+        if (msg.e !== 'depthUpdate') return; // игнорируем служебные ответы на SUBSCRIBE и т.п.
+        this.handleDiffEvent(msg);
+      });
+      this.ws.on('close', () => { console.log(`Binance ${marketLabel} WS: закрыто, переподключаюсь`); setTimeout(() => this.connect(), 3000); });
+      this.ws.on('error', (err) => { console.log(`Binance ${marketLabel} WS ошибка:`, err.message); this.ws.close(); });
+      // Пинг от сервера каждые 20с — библиотека 'ws' отвечает pong автоматически, ничего не пишем
+    },
+    sendSubscribe(symbolLower) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: [`${symbolLower}@depth`], id: this.nextId++ }));
+      }
+    },
+    async fetchSnapshotAndSync(symbolUpper, key) {
+      try {
+        const resp = await fetch(restSnapshotUrl(symbolUpper));
+        const snap = await resp.json();
+        const book = ensureBook(key);
+        book.asks = new Map((snap.asks || []).map(([p, s]) => [p, s]));
+        book.bids = new Map((snap.bids || []).map(([p, s]) => [p, s]));
+        book.lastUpdateId = snap.lastUpdateId;
+        // Применяем то, что накопилось в буфере, пока ждали снапшот — по правилам официального алгоритма
+        const pend = this.pending.get(symbolUpper.toLowerCase());
+        const buffered = (pend && pend.buffer) || [];
+        let firstApplied = false;
+        for (const evt of buffered) {
+          if (evt.u <= book.lastUpdateId) continue; // событие старше снапшота — пропускаем
+          if (!firstApplied) {
+            // первое применяемое событие должно "накрывать" lastUpdateId снапшота
+            firstApplied = true;
+          }
+          applyLevels(book.asks, evt.b || []);
+          applyLevels(book.bids, evt.a || []);
+          book.lastUpdateId = evt.u;
+        }
+        book.ready = true;
+        if (pend) pend.snapshotRequested = true; // дальше live-события применяем напрямую, без буфера
+      } catch (err) {
+        console.log(`Binance ${marketLabel}: ошибка снапшота для ${symbolUpper}:`, err.message);
+        // не выставляем ready — клиент получит warming_up и попробует ещё раз
+      }
+    },
+    handleDiffEvent(msg) {
+      const symbolUpper = msg.s;
+      const symbolLower = symbolUpper.toLowerCase();
+      const key = bookKey('binance-' + marketLabel, 'X', symbolUpper);
+      let pend = this.pending.get(symbolLower);
+      if (!pend) return; // событие по символу, который мы не запрашивали (не должно происходить)
+
+      if (!pend.snapshotRequested) {
+        // Снапшот ещё не готов — буферизируем, а не применяем напрямую (по официальному алгоритму)
+        pend.buffer.push(msg);
+        return;
+      }
+      const book = books.get(key);
+      if (!book) return;
+      // Проверка непрерывности: если разрыв — пересинхронизируемся с нуля через новый снапшот
+      if (book.lastUpdateId != null && msg.U > book.lastUpdateId + 1) {
+        console.log(`Binance ${marketLabel}: разрыв последовательности у ${symbolUpper}, пересинхронизация`);
+        book.ready = false;
+        pend.snapshotRequested = false;
+        pend.buffer = [msg];
+        this.fetchSnapshotAndSync(symbolUpper, key);
+        return;
+      }
+      applyLevels(book.asks, msg.b || []);
+      applyLevels(book.bids, msg.a || []);
+      book.lastUpdateId = msg.u;
+    },
+    requestSymbol(symbol) {
+      const symbolUpper = symbol.toUpperCase();
+      const symbolLower = symbol.toLowerCase();
+      const key = bookKey('binance-' + marketLabel, 'X', symbolUpper);
+      if (!this.subscribed.has(symbolLower)) {
+        this.subscribed.add(symbolLower);
+        this.pending.set(symbolLower, { buffer: [], snapshotRequested: false });
+        ensureBook(key);
+        this.sendSubscribe(symbolLower);
+        this.fetchSnapshotAndSync(symbolUpper, key); // запускаем сразу, не дожидаясь событий из стрима
+      }
+      return key;
+    },
+  };
+}
+
+const binanceSpot = makeBinanceAdapter(
+  'wss://stream.binance.com:9443/ws',
+  (sym) => `https://api.binance.com/api/v3/depth?symbol=${sym}&limit=5000`,
+  'spot'
+);
+const binanceFutures = makeBinanceAdapter(
+  'wss://fstream.binance.com/ws',
+  (sym) => `https://fapi.binance.com/fapi/v1/depth?symbol=${sym}&limit=1000`,
+  'futures'
+);
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
-const ADAPTERS = { bitget, whitebit };
+const ADAPTERS = {
+  bitget, whitebit,
+  binance: {
+    requestSymbol: (symbol, marketType) => (marketType === 'futures' ? binanceFutures : binanceSpot).requestSymbol(symbol),
+    connect: () => { binanceSpot.connect(); binanceFutures.connect(); },
+    // У Binance два реальных соединения (спот+фьючи) под одной записью в ADAPTERS — отдаём оба состояния
+    wsStateReport: () => ({ spot: binanceSpot.ws ? binanceSpot.ws.readyState : 'not connected', futures: binanceFutures.ws ? binanceFutures.ws.readyState : 'not connected' }),
+  },
+};
 
 // Ждёт, пока стакан по ключу станет готов (пришёл снапшот) — вместо того чтобы сразу сдаваться.
 // На практике снапшот приходит за 1-2 секунды после подписки; 8 секунд — комфортный запас сверху.
@@ -212,7 +335,10 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'multi-exchange-ws-depth',
-    connected: Object.keys(ADAPTERS).map((k) => ({ exchange: k, wsState: ADAPTERS[k].ws ? ADAPTERS[k].ws.readyState : 'not connected' })),
+    connected: Object.keys(ADAPTERS).map((k) => ({
+      exchange: k,
+      wsState: ADAPTERS[k].wsStateReport ? ADAPTERS[k].wsStateReport() : (ADAPTERS[k].ws ? ADAPTERS[k].ws.readyState : 'not connected'),
+    })),
     subscribedCount: books.size,
   });
 });
