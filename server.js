@@ -608,7 +608,7 @@ const gateFutures = {
         time: Math.floor(Date.now() / 1000),
         channel: 'futures.order_book_update',
         event: 'subscribe',
-        payload: [symbol, '100ms', '400'], // пробуем 400 — между подтверждённым 300 и отклонённым 500
+        payload: [symbol, '100ms', '350'], // пробуем 350 — вдруг валидный шаг между 300 и 400
       }));
     }
   },
