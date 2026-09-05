@@ -557,36 +557,80 @@ const kucoinFutures = makeKuCoinAdapter(
 // (пришлось добавлять общую защиту от падений во всём сервере). Раз REST и так честно даёт 300
 // уровней без сбоев — не воюем дальше с WS для Gate, а просто пробрасываем REST-запрос через
 // этот же сервер (тот же единый адрес для Apps Script, без смены кода таблицы).
-async function gateRestPassthrough(req, res, symbol) {
-  try {
-    const resp = await fetch(`https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=${symbol}&limit=300`);
-    const text = await resp.text();
-    res.status(resp.status).set('Content-Type', 'application/json').send(text);
-  } catch (err) {
-    res.status(502).json({ error: 'gate_rest_passthrough_failed', message: err.message });
-  }
-}
+// gateRestPassthrough удалён — Gate теперь работает через настоящий WS (futures.obu, 400 уровней,
+// см. gateFutures ниже), REST-проброс больше не используется
 
-// ==================== ДИАГНОСТИКА: futures.obu — правда ли на боевом сервере уже бинарный SBE? ====================
-// Официальное объявление Gate (февр. 2026): SBE был запущен ПОКА только на demo-окружении, для
-// боевого сервера — "будет объявлено отдельно". Возможно, на боевом futures.obu до сих пор просто
-// JSON. Не встраиваем в основной поток данных — только логируем сырой ответ, чтобы увидеть глазами,
-// что реально приходит, вместо того чтобы гадать дальше.
-const gateObuDiagnostic = {
+// ==================== АДАПТЕР: GATE FUTURES — futures.obu (400 уровней, подтверждено JSON) ====================
+// Подтверждено диагностикой живьём: боевой сервер отдаёт по этому каналу обычный JSON (SBE ещё не
+// докатился до прода — было только на demo-окружении по офиц. объявлению Gate). Сам канал отдаёт
+// только ДЕЛЬТЫ (U/u), полного снапшота в потоке не видно — значит нужна та же REST-сверка, что и
+// у Binance: буферизируем дельты, параллельно берём REST-снапшот с with_id=true, склеиваем по U/u.
+
+const gateFutures = {
   ws: null, subscribed: new Set(),
+  pending: new Map(), // symbol -> { buffer: [], snapshotRequested: bool }
   connect() {
     this.ws = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
     this.ws.on('open', () => {
-      console.log('Gate obu-диагностика: открыто');
+      console.log('Gate futures.obu WS: открыто');
       for (const symbol of this.subscribed) this.doSubscribe(symbol);
     });
     this.ws.on('message', (raw) => {
-      const text = raw.toString('utf8', 0, 300); // первые 300 символов достаточно, чтобы понять формат
-      const looksLikeJson = text.trim().startsWith('{');
-      console.log(`Gate obu-диагностика: получено сообщение (похоже на JSON: ${looksLikeJson}):`, text);
+      let msg;
+      try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      if (msg.error) { console.log('Gate futures.obu: ошибка от биржи —', JSON.stringify(msg.error)); return; }
+      if (msg.channel !== 'futures.obu' || !msg.result) return;
+      const r = msg.result;
+      const symbol = String(r.s || '').replace(/^ob\./, '').replace(/\.\d+$/, ''); // "ob.BTC_USDT.400" -> "BTC_USDT"
+      this.handleDelta(symbol, r);
     });
-    this.ws.on('close', () => { console.log('Gate obu-диагностика: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
-    this.ws.on('error', (err) => { console.log('Gate obu-диагностика: ошибка', err.message); this.ws.close(); });
+    this.ws.on('close', () => { console.log('Gate futures.obu WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('Gate futures.obu WS ошибка:', err.message); this.ws.close(); });
+  },
+  async fetchSnapshotAndSync(symbol, key) {
+    try {
+      const resp = await fetch(`https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=${symbol}&limit=400&with_id=true`);
+      const snap = await resp.json();
+      const book = ensureBook(key);
+      book.asks = new Map((snap.asks || []).map((lvl) => (Array.isArray(lvl) ? lvl : [lvl.p, String(lvl.s)])));
+      book.bids = new Map((snap.bids || []).map((lvl) => (Array.isArray(lvl) ? lvl : [lvl.p, String(lvl.s)])));
+      book.lastUpdateId = snap.id;
+      const pend = this.pending.get(symbol);
+      const buffered = (pend && pend.buffer) || [];
+      for (const evt of buffered) {
+        if (evt.u <= book.lastUpdateId) continue; // дельта старше снапшота — пропускаем
+        applyLevels(book.asks, evt.a || []);
+        applyLevels(book.bids, evt.b || []);
+        book.lastUpdateId = evt.u;
+      }
+      book.ready = true;
+      if (pend) pend.snapshotRequested = true;
+    } catch (err) {
+      console.log('Gate futures.obu: ошибка снапшота для', symbol, ':', err.message);
+    }
+  },
+  handleDelta(symbol, r) {
+    const key = bookKey('gate-futures', 'X', symbol);
+    const pend = this.pending.get(symbol);
+    if (!pend) return; // символ, который мы не запрашивали
+    if (!pend.snapshotRequested) {
+      pend.buffer.push(r);
+      return;
+    }
+    const book = books.get(key);
+    if (!book) return;
+    if (book.lastUpdateId != null && r.U > book.lastUpdateId + 1) {
+      console.log(`Gate futures.obu: разрыв последовательности у ${symbol}, пересинхронизация`);
+      book.ready = false;
+      pend.snapshotRequested = false;
+      pend.buffer = [r];
+      this.fetchSnapshotAndSync(symbol, key);
+      return;
+    }
+    if (r.u <= book.lastUpdateId) return; // устаревшая дельта
+    applyLevels(book.asks, r.a || []);
+    applyLevels(book.bids, r.b || []);
+    book.lastUpdateId = r.u;
   },
   doSubscribe(symbol) {
     this.subscribed.add(symbol);
@@ -599,7 +643,19 @@ const gateObuDiagnostic = {
       }));
     }
   },
+  requestSymbol(symbol) {
+    const key = bookKey('gate-futures', 'X', symbol);
+    if (!this.subscribed.has(symbol)) {
+      this.subscribed.add(symbol);
+      this.pending.set(symbol, { buffer: [], snapshotRequested: false });
+      ensureBook(key);
+      this.doSubscribe(symbol);
+      this.fetchSnapshotAndSync(symbol, key); // запускаем сразу, не дожидаясь дельт из стрима
+    }
+    return key;
+  },
 };
+
 
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
@@ -621,7 +677,12 @@ const ADAPTERS = {
     connect: () => { kucoinSpot.connect(); kucoinFutures.connect(); },
     wsStateReport: () => ({ spot: kucoinSpot.ws ? kucoinSpot.ws.readyState : 'not connected', futures: kucoinFutures.ws ? kucoinFutures.ws.readyState : 'not connected' }),
   },
-  // Gate — не через ADAPTERS вообще, обрабатывается отдельной веткой в /depth (REST-проброс, и для спота, и для фьючей)
+  // Gate — только фьючи через WS (futures.obu, 400 уровней), спот остаётся на REST напрямую из Apps Script
+  gate: {
+    requestSymbol: (symbol) => gateFutures.requestSymbol(symbol),
+    connect: () => gateFutures.connect(),
+    wsStateReport: () => ({ futures: gateFutures.ws ? gateFutures.ws.readyState : 'not connected' }),
+  },
 };
 
 // Ждёт, пока стакан по ключу станет готов (пришёл снапшот) — вместо того чтобы сразу сдаваться.
@@ -644,9 +705,6 @@ app.get('/depth', async (req, res) => {
   const symbol = req.query.symbol;
   const marketType = req.query.marketType === 'futures' ? 'futures' : 'spot';
   if (!exchange || !symbol) return res.status(400).json({ error: 'exchange and symbol query params are required' });
-
-  // Gate — особый случай: REST-проброс вместо WS-стакана (см. комментарий у gateRestPassthrough)
-  if (exchange === 'gate') return gateRestPassthrough(req, res, symbol);
 
   const adapter = ADAPTERS[exchange];
   if (!adapter) return res.status(400).json({ error: `Биржа "${exchange}" пока не подключена к WS-серверу` });
@@ -690,8 +748,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Multi-exchange WS depth server listening on port ${PORT}`);
   Object.values(ADAPTERS).forEach((a) => a.connect());
-  // Диагностика Gate futures.obu — подписываемся на BTC_USDT сразу при старте, чтобы увидеть
-  // в логах Render, JSON там или бинарный SBE, не дожидаясь запроса из таблицы.
-  gateObuDiagnostic.connect();
-  setTimeout(() => gateObuDiagnostic.doSubscribe('BTC_USDT'), 2000);
 });
