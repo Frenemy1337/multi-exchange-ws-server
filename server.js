@@ -633,7 +633,7 @@ const gateFutures = {
 // только у старого REST API v0/v1!). Наш склеенный тикер вида "XBTUSD" нужно разобрать обратно на
 // базу+валюту и превратить XBT снова в BTC — делаем это тем же приёмом "отрезать известный хвост
 // валюты", что и в Apps Script для остальных бирж.
-const KRAKEN_QUOTE_SUFFIXES = ['USDT', 'USDC', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'CHF', 'USD'];
+const KRAKEN_QUOTE_SUFFIXES = ['USDT', 'USDC', 'DAI', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD', 'CHF', 'NZD', 'USD'];
 function krakenSymbolToPair(symbol) {
   const s = symbol.toUpperCase();
   for (const q of KRAKEN_QUOTE_SUFFIXES) {
