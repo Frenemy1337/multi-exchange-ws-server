@@ -1018,45 +1018,82 @@ function findPriceQtyLists(fields, path, results) {
   return results;
 }
 
-const mexcDiagnostic = {
-  ws: null,
+// ==================== АДАПТЕР: MEXC (спот, protobuf) ====================
+// Подтверждено живьём (не по чужой схеме): поле 1 = имя канала, поле 3 = символ, поле 313 —
+// контейнер уровней, где 313.1 = аски, 313.2 = биды (каждый — {1: цена-строка, 2: объём-строка}).
+// У канала НЕТ видимого номера последовательности для точной сверки разрывов (в отличие от
+// Binance/KuCoin) — поэтому вместо строгой калибровки U/u периодически (раз в минуту)
+// переспрашиваем полный REST-снапшот для самоисправления накопленного дрейфа.
+
+const MEXC_ASKS_FIELD = '1', MEXC_BIDS_FIELD = '2', MEXC_ENTRIES_FIELD = '313', MEXC_SYMBOL_FIELD = '3';
+
+const mexc = {
+  ws: null, subscribed: new Set(), refreshTimers: new Map(),
   connect() {
     this.ws = new WebSocket('wss://wbs-api.mexc.com/ws');
     this.ws.on('open', () => {
-      console.log('MEXC obu-диагностика: открыто, подписываюсь на BTCUSDT');
-      this.ws.send(JSON.stringify({ method: 'SUBSCRIPTION', params: ['spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDT'] }));
+      console.log('MEXC WS: открыто');
+      for (const symbol of this.subscribed) this.doSubscribe(symbol);
     });
     this.ws.on('message', (raw) => {
-      if (typeof raw === 'string' || raw.length < 5) return; // служебный текстовый ответ, не бинарные данные
-      try {
-        const fields = decodeProtobuf(raw);
-        // Верхний уровень — ищем поле с именем символа (строка "BTCUSDT" где-то в length-delimited полях)
-        for (const fieldNum of Object.keys(fields)) {
-          for (const entry of fields[fieldNum]) {
-            if (entry.wireType === 2 && Buffer.isBuffer(entry.value)) {
-              const asText = entry.value.toString('utf8');
-              if (/^[A-Za-z0-9._@]+$/.test(asText) && asText.length < 100) {
-                console.log(`MEXC obu-диагностика: верхнее поле ${fieldNum} — похоже на текст: "${asText}"`);
-              }
-            }
-          }
-        }
-        const candidates = findPriceQtyLists(fields);
-        console.log('MEXC obu-диагностика: найдено кандидатов на bids/asks:', candidates.length);
-        candidates.forEach((c) => console.log('  путь', c.path.join('.'), '— записей:', c.count, '— пример:', JSON.stringify(c.sample)));
-      } catch (err) {
-        console.log('MEXC obu-диагностика: ошибка декодирования —', err.message);
+      if (typeof raw === 'string' || raw.length < 5) return; // служебный текстовый ответ на подписку
+      let fields;
+      try { fields = decodeProtobuf(raw); } catch (e) { return; }
+      const symbolEntry = fields[MEXC_SYMBOL_FIELD] && fields[MEXC_SYMBOL_FIELD][0];
+      if (!symbolEntry || !Buffer.isBuffer(symbolEntry.value)) return;
+      const symbol = symbolEntry.value.toString('utf8');
+      const entriesField = fields[MEXC_ENTRIES_FIELD];
+      if (!entriesField) return;
+      const key = bookKey('mexc', 'X', symbol);
+      const book = books.get(key);
+      if (!book || !book.ready) return; // ждём, пока REST-снапшот подгрузится
+      for (const entry of entriesField) {
+        if (entry.wireType !== 2 || !Buffer.isBuffer(entry.value)) continue;
+        const sub = decodeProtobuf(entry.value);
+        const asksRaw = (sub[MEXC_ASKS_FIELD] || []).map((e) => tryDecodeAsPriceQty(e.value)).filter(Boolean);
+        const bidsRaw = (sub[MEXC_BIDS_FIELD] || []).map((e) => tryDecodeAsPriceQty(e.value)).filter(Boolean);
+        applyLevels(book.asks, asksRaw.map((x) => [x.price, x.qty]));
+        applyLevels(book.bids, bidsRaw.map((x) => [x.price, x.qty]));
       }
     });
-    this.ws.on('close', () => { console.log('MEXC obu-диагностика: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
-    this.ws.on('error', (err) => { console.log('MEXC obu-диагностика: ошибка', err.message); this.ws.close(); });
+    this.ws.on('close', () => { console.log('MEXC WS: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('MEXC WS ошибка:', err.message); this.ws.close(); });
+  },
+  async fetchSnapshot(symbol, key) {
+    try {
+      const resp = await fetch(`https://api.mexc.com/api/v3/depth?symbol=${symbol}&limit=5000`);
+      const snap = await resp.json();
+      const book = ensureBook(key);
+      book.asks = new Map((snap.asks || []).map(([p, s]) => [p, s]));
+      book.bids = new Map((snap.bids || []).map(([p, s]) => [p, s]));
+      book.ready = true;
+    } catch (err) {
+      console.log('MEXC: ошибка снапшота для', symbol, ':', err.message);
+    }
+  },
+  doSubscribe(symbol) {
+    this.subscribed.add(symbol);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ method: 'SUBSCRIPTION', params: [`spot@public.aggre.depth.v3.api.pb@100ms@${symbol}`] }));
+    }
+  },
+  requestSymbol(symbol) {
+    const key = bookKey('mexc', 'X', symbol);
+    if (!this.subscribed.has(symbol)) {
+      ensureBook(key);
+      this.doSubscribe(symbol);
+      this.fetchSnapshot(symbol, key);
+      // Самоисправление раз в минуту — нет номера последовательности для честной проверки разрывов
+      this.refreshTimers.set(symbol, setInterval(() => this.fetchSnapshot(symbol, key), 60000));
+    }
+    return key;
   },
 };
 
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
-  bitget, whitebit, okx,
+  bitget, whitebit, okx, mexc,
   binance: {
     requestSymbol: (symbol, marketType) => (marketType === 'futures' ? binanceFutures : binanceSpot).requestSymbol(symbol),
     connect: () => { binanceSpot.connect(); binanceFutures.connect(); },
