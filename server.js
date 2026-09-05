@@ -927,6 +927,121 @@ const bitfinex = {
   },
 };
 
+// ==================== ДИАГНОСТИКА: MEXC protobuf — универсальный сырой декодер ====================
+// Ни официальная схема (mexcdevelop/websocket-proto — подтверждённо неверная по независимому
+// источнику), ни чужой реверс-инжиниринг из одной статьи не заслуживают доверия без проверки.
+// Вместо этого — свой декодер по ОБЩИМ правилам формата Protobuf (без знания точных названий
+// полей), который сам находит внутри структуру вида "цена+объём" (два текстовых поля подряд) —
+// и сверяем результат с REST на той же паре, прежде чем на него полагаться.
+
+function readVarint(buf, pos) {
+  let result = 0, shift = 0;
+  while (true) {
+    const byte = buf[pos++];
+    result += (byte & 0x7f) * Math.pow(2, shift);
+    if ((byte & 0x80) === 0) break;
+    shift += 7;
+  }
+  return [result, pos];
+}
+
+// Разбирает буфер по общим правилам wire-формата Protobuf в дерево {номерПоля: [{wireType, value}]}
+function decodeProtobuf(buf, start, end) {
+  const fields = {};
+  let pos = start === undefined ? 0 : start;
+  const limit = end === undefined ? buf.length : end;
+  while (pos < limit) {
+    let tag;
+    try { [tag, pos] = readVarint(buf, pos); } catch (e) { break; }
+    const fieldNumber = tag >>> 3;
+    const wireType = tag & 0x7;
+    let value;
+    if (wireType === 0) {
+      try { [value, pos] = readVarint(buf, pos); } catch (e) { break; }
+    } else if (wireType === 2) {
+      let len;
+      try { [len, pos] = readVarint(buf, pos); } catch (e) { break; }
+      if (pos + len > limit) break; // повреждённые/непонятные данные — не читаем дальше мусор
+      value = buf.slice(pos, pos + len);
+      pos += len;
+    } else if (wireType === 1) {
+      if (pos + 8 > limit) break;
+      value = buf.readDoubleLE(pos); pos += 8;
+    } else if (wireType === 5) {
+      if (pos + 4 > limit) break;
+      value = buf.readFloatLE(pos); pos += 4;
+    } else {
+      break; // неподдерживаемый/повреждённый wire-тип — останавливаемся, не гадаем
+    }
+    if (!fields[fieldNumber]) fields[fieldNumber] = [];
+    fields[fieldNumber].push({ wireType, value });
+  }
+  return fields;
+}
+
+// Пробует прочитать буфер как вложенное "Bid"/"Ask"-сообщение: поле 1 = цена (строка-число),
+// поле 2 = объём (строка-число). Это самая вероятная нумерация для двухполевого сообщения —
+// почти все схемы, что видели сегодня у других бирж, нумеруют поля именно в порядке объявления.
+function tryDecodeAsPriceQty(buf) {
+  if (!Buffer.isBuffer(buf)) return null;
+  const sub = decodeProtobuf(buf);
+  if (!sub[1] || !sub[2]) return null;
+  const priceVal = sub[1][0].value, qtyVal = sub[2][0].value;
+  if (!Buffer.isBuffer(priceVal) || !Buffer.isBuffer(qtyVal)) return null;
+  const price = priceVal.toString('utf8');
+  const qty = qtyVal.toString('utf8');
+  if (!/^\d+\.?\d*$/.test(price) || !/^\d+\.?\d*$/.test(qty)) return null;
+  return { price, qty };
+}
+
+// Рекурсивно обходит всё дерево в поисках полей, ВСЕ повторения которых распознаются как
+// цена+объём — это и есть кандидат на список bids или asks. Возвращает все найденные кандидаты
+// с указанием "пути" (цепочки номеров полей), чтобы можно было сверить с реальными ценами.
+function findPriceQtyLists(fields, path, results) {
+  path = path || [];
+  results = results || [];
+  for (const fieldNumStr of Object.keys(fields)) {
+    const entries = fields[fieldNumStr];
+    const lengthDelimited = entries.filter((e) => e.wireType === 2);
+    if (lengthDelimited.length > 0) {
+      const decoded = lengthDelimited.map((e) => tryDecodeAsPriceQty(e.value));
+      if (decoded.every((d) => d !== null) && decoded.length > 0) {
+        results.push({ path: [...path, fieldNumStr], count: decoded.length, sample: decoded.slice(0, 3) });
+      }
+      // Всё равно копаем глубже — вдруг настоящий список вложен ещё на уровень ниже
+      for (const e of lengthDelimited) {
+        const nested = decodeProtobuf(e.value);
+        if (Object.keys(nested).length > 0) findPriceQtyLists(nested, [...path, fieldNumStr], results);
+      }
+    }
+  }
+  return results;
+}
+
+const mexcDiagnostic = {
+  ws: null,
+  connect() {
+    this.ws = new WebSocket('wss://wbs-api.mexc.com/ws');
+    this.ws.on('open', () => {
+      console.log('MEXC obu-диагностика: открыто, подписываюсь на BTCUSDT');
+      this.ws.send(JSON.stringify({ method: 'SUBSCRIPTION', params: ['spot@public.aggre.depth.v3.api.pb@100ms@BTCUSDT'] }));
+    });
+    this.ws.on('message', (raw) => {
+      if (typeof raw === 'string' || raw.length < 5) return; // служебный текстовый ответ, не бинарные данные
+      try {
+        const fields = decodeProtobuf(raw);
+        const candidates = findPriceQtyLists(fields);
+        console.log('MEXC obu-диагностика: найдено кандидатов на bids/asks:', candidates.length);
+        candidates.forEach((c) => console.log('  путь', c.path.join('.'), '— записей:', c.count, '— пример:', JSON.stringify(c.sample)));
+      } catch (err) {
+        console.log('MEXC obu-диагностика: ошибка декодирования —', err.message);
+      }
+    });
+    this.ws.on('close', () => { console.log('MEXC obu-диагностика: закрыто, переподключаюсь'); setTimeout(() => this.connect(), 3000); });
+    this.ws.on('error', (err) => { console.log('MEXC obu-диагностика: ошибка', err.message); this.ws.close(); });
+  },
+};
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
@@ -1026,4 +1141,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Multi-exchange WS depth server listening on port ${PORT}`);
   Object.values(ADAPTERS).forEach((a) => a.connect());
+  // Диагностика MEXC protobuf — сама подписывается на BTCUSDT и логирует, что нашла внутри
+  // бинарных сообщений. НЕ встроена в основной поток данных — только для проверки глазами.
+  mexcDiagnostic.connect();
 });
