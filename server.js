@@ -27,6 +27,7 @@
 
 const express = require('express');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 const app = express();
 
 // ==================== ОБЩИЕ УТИЛИТЫ (одни на все биржи) ====================
@@ -395,6 +396,156 @@ function makeBybitAdapter(wsUrl, depth, marketLabel) {
 const bybitSpot = makeBybitAdapter('wss://stream.bybit.com/v5/public/spot', 1000, 'spot');
 const bybitLinear = makeBybitAdapter('wss://stream.bybit.com/v5/public/linear', 1000, 'linear');
 
+// ==================== АДАПТЕР: KUCOIN ====================
+// Самый "тяжёлый" протокол: 1) получить одноразовый токен подключения (POST bullet-public),
+// 2) подписаться на канал ДЕЛЬТ (полного снапшота в стриме нет), 3) отдельно взять REST-снапшот
+// и сверить по sequenceStart/sequenceEnd — та же идея, что и у Binance. REST-снапшот СПОТА требует
+// авторизации (нужны те же переменные окружения KUCOIN_API_KEY/SECRET/PASSPHRASE, что и в старом
+// REST-прокси) — фьючерсный снапшот публичный, без ключа.
+
+function kucoinSignedFetch(pathAndQuery) {
+  const timestamp = Date.now().toString();
+  const strToSign = timestamp + 'GET' + pathAndQuery;
+  const sign = crypto.createHmac('sha256', process.env.KUCOIN_API_SECRET).update(strToSign).digest('base64');
+  const passphrase = crypto.createHmac('sha256', process.env.KUCOIN_API_SECRET).update(process.env.KUCOIN_API_PASSPHRASE).digest('base64');
+  return fetch(`https://api.kucoin.com${pathAndQuery}`, {
+    headers: {
+      'KC-API-KEY': process.env.KUCOIN_API_KEY,
+      'KC-API-SIGN': sign,
+      'KC-API-TIMESTAMP': timestamp,
+      'KC-API-PASSPHRASE': passphrase,
+      'KC-API-KEY-VERSION': '2',
+    },
+  });
+}
+
+function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher) {
+  return {
+    ws: null, pingTimer: null, nextId: 1, subscribed: new Set(),
+    pending: new Map(), // symbol -> { buffer: [], snapshotRequested: bool }
+    async connect() {
+      try {
+        const resp = await fetch(tokenUrl, { method: 'POST' });
+        const json = await resp.json();
+        const token = json.data.token;
+        const server = json.data.instanceServers[0];
+        this.pingIntervalMs = server.pingInterval || 18000;
+        const connectId = Date.now().toString();
+        this.ws = new WebSocket(`${server.endpoint}?token=${token}&connectId=${connectId}`);
+        this.ws.on('open', () => console.log(`KuCoin ${marketLabel} WS: соединение открыто, жду welcome`));
+        this.ws.on('message', (raw) => {
+          let msg;
+          try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+          if (msg.type === 'welcome') {
+            console.log(`KuCoin ${marketLabel} WS: welcome получен`);
+            for (const symbol of this.subscribed) this.sendSubscribe(symbol);
+            this.startPing();
+            return;
+          }
+          if (msg.type === 'message' && msg.topic && msg.topic.startsWith(topicPrefix)) {
+            this.handleUpdate(msg);
+          }
+        });
+        this.ws.on('close', () => { console.log(`KuCoin ${marketLabel} WS: закрыто, переподключаюсь`); clearInterval(this.pingTimer); setTimeout(() => this.connect(), 3000); });
+        this.ws.on('error', (err) => { console.log(`KuCoin ${marketLabel} WS ошибка:`, err.message); this.ws.close(); });
+      } catch (err) {
+        console.log(`KuCoin ${marketLabel}: не смог получить токен подключения, повтор через 5с:`, err.message);
+        setTimeout(() => this.connect(), 5000);
+      }
+    },
+    startPing() {
+      clearInterval(this.pingTimer);
+      this.pingTimer = setInterval(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ id: String(this.nextId++), type: 'ping' }));
+        }
+      }, this.pingIntervalMs || 18000);
+    },
+    sendSubscribe(symbol) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ id: this.nextId++, type: 'subscribe', topic: `${topicPrefix}${symbol}`, response: true }));
+      }
+    },
+    async fetchSnapshotAndSync(symbol, key) {
+      try {
+        const snap = await snapshotFetcher(symbol);
+        const d = snap.data;
+        const book = ensureBook(key);
+        book.asks = new Map((d.asks || []).map(([p, s]) => [p, s]));
+        book.bids = new Map((d.bids || []).map(([p, s]) => [p, s]));
+        book.sequence = Number(d.sequence != null ? d.sequence : d.sequenceEnd || 0);
+        const pend = this.pending.get(symbol);
+        const buffered = (pend && pend.buffer) || [];
+        for (const evt of buffered) {
+          if (evt.sequenceEnd <= book.sequence) continue; // событие старше снапшота
+          applyLevels(book.asks, (evt.changes && evt.changes.asks) || []);
+          applyLevels(book.bids, (evt.changes && evt.changes.bids) || []);
+          book.sequence = evt.sequenceEnd;
+        }
+        book.ready = true;
+        if (pend) pend.snapshotRequested = true;
+      } catch (err) {
+        console.log(`KuCoin ${marketLabel}: ошибка снапшота для ${symbol}:`, err.message);
+      }
+    },
+    handleUpdate(msg) {
+      const symbol = msg.topic.split(':')[1];
+      const key = bookKey('kucoin-' + marketLabel, 'X', symbol);
+      const pend = this.pending.get(symbol);
+      if (!pend) return; // символ, который мы не запрашивали
+      const d = msg.data;
+      if (!pend.snapshotRequested) {
+        pend.buffer.push(d);
+        return;
+      }
+      const book = books.get(key);
+      if (!book) return;
+      if (d.sequenceStart > book.sequence + 1) {
+        console.log(`KuCoin ${marketLabel}: разрыв последовательности у ${symbol}, пересинхронизация`);
+        book.ready = false;
+        pend.snapshotRequested = false;
+        pend.buffer = [d];
+        this.fetchSnapshotAndSync(symbol, key);
+        return;
+      }
+      if (d.sequenceEnd <= book.sequence) return; // устаревшее событие, игнорируем
+      applyLevels(book.asks, (d.changes && d.changes.asks) || []);
+      applyLevels(book.bids, (d.changes && d.changes.bids) || []);
+      book.sequence = d.sequenceEnd;
+    },
+    requestSymbol(symbol) {
+      const key = bookKey('kucoin-' + marketLabel, 'X', symbol);
+      if (!this.subscribed.has(symbol)) {
+        this.subscribed.add(symbol);
+        this.pending.set(symbol, { buffer: [], snapshotRequested: false });
+        ensureBook(key);
+        this.sendSubscribe(symbol);
+        this.fetchSnapshotAndSync(symbol, key);
+      }
+      return key;
+    },
+  };
+}
+
+const kucoinSpot = makeKuCoinAdapter(
+  'https://api.kucoin.com/api/v1/bullet-public',
+  '/market/level2:',
+  'spot',
+  async (symbol) => {
+    const resp = await kucoinSignedFetch(`/api/v3/market/orderbook/level2?symbol=${symbol}`);
+    return resp.json();
+  }
+);
+const kucoinFutures = makeKuCoinAdapter(
+  'https://api-futures.kucoin.com/api/v1/bullet-public',
+  '/contractMarket/level2:',
+  'futures',
+  async (symbol) => {
+    const resp = await fetch(`https://api-futures.kucoin.com/api/v1/level2/snapshot?symbol=${symbol}`);
+    return resp.json();
+  }
+);
+
 // ==================== HTTP-ЭНДПОИНТ (общий для всех бирж) ====================
 
 const ADAPTERS = {
@@ -409,6 +560,11 @@ const ADAPTERS = {
     requestSymbol: (symbol, marketType) => (marketType === 'futures' ? bybitLinear : bybitSpot).requestSymbol(symbol),
     connect: () => { bybitSpot.connect(); bybitLinear.connect(); },
     wsStateReport: () => ({ spot: bybitSpot.ws ? bybitSpot.ws.readyState : 'not connected', linear: bybitLinear.ws ? bybitLinear.ws.readyState : 'not connected' }),
+  },
+  kucoin: {
+    requestSymbol: (symbol, marketType) => (marketType === 'futures' ? kucoinFutures : kucoinSpot).requestSymbol(symbol),
+    connect: () => { kucoinSpot.connect(); kucoinFutures.connect(); },
+    wsStateReport: () => ({ spot: kucoinSpot.ws ? kucoinSpot.ws.readyState : 'not connected', futures: kucoinFutures.ws ? kucoinFutures.ws.readyState : 'not connected' }),
   },
 };
 
