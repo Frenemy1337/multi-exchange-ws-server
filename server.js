@@ -725,7 +725,8 @@ function krakenSymbolToPair(symbol) {
 }
 
 const kraken = {
-  ws: null, subscribed: new Set(),
+  ws: null, subscribed: new Set(), nextReqId: 1,
+  pendingReqIds: new Map(), // req_id -> внутренний символ ("HYPEUSDT" и т.п.) — чтобы связать ответ об ошибке с конкретной парой (result отсутствует при ошибке, только req_id есть всегда)
   connect() {
     this.ws = new WebSocket('wss://ws.kraken.com/v2');
     this.ws.on('open', () => {
@@ -737,16 +738,13 @@ const kraken = {
       try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
       // Ответ об ОШИБКЕ подписки (например, биржа не знает такую пару) — раньше молча игнорировался,
       // из-за чего клиент вечно ждал снапшот, который никогда не придёт ("warming_up" без конца).
-      // Теперь помечаем книгу как ОКОНЧАТЕЛЬНО отклонённую — /depth сразу отдаст настоящую причину.
+      // ВАЖНО: при ошибке поле result у Kraken v2 ОТСУТСТВУЕТ целиком (подтверждено официальной
+      // схемой) — символ пары узнаём через req_id, который мы сами присвоили при подписке.
       if (msg.success === false) {
         const reason = msg.error || JSON.stringify(msg);
         console.log('Kraken WS: подписка отклонена —', reason);
-        const pairFromResult = msg.result && msg.result.symbol; // например "HYPE/USDT"
-        if (pairFromResult) {
-          const [base, quote] = pairFromResult.split('/');
-          const internalSymbol = (base === 'BTC' ? 'XBT' : base) + quote;
-          markRejected(bookKey('kraken', 'X', internalSymbol), reason);
-        }
+        const internalSymbol = this.pendingReqIds.get(msg.req_id);
+        if (internalSymbol) markRejected(bookKey('kraken', 'X', internalSymbol), reason);
         return;
       }
       if (msg.channel !== 'book' || !msg.data) return;
@@ -772,9 +770,12 @@ const kraken = {
   doSubscribe(symbol) {
     this.subscribed.add(symbol);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const reqId = this.nextReqId++;
+      this.pendingReqIds.set(reqId, symbol);
       this.ws.send(JSON.stringify({
         method: 'subscribe',
         params: { channel: 'book', symbol: [krakenSymbolToPair(symbol)], depth: 1000 },
+        req_id: reqId,
       }));
     }
   },
