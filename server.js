@@ -40,8 +40,16 @@ function bookKey(exchange, instType, instId) {
   return `${exchange}:${instType}:${instId}`;
 }
 function ensureBook(key) {
-  if (!books.has(key)) books.set(key, { asks: new Map(), bids: new Map(), ready: false });
+  if (!books.has(key)) books.set(key, { asks: new Map(), bids: new Map(), ready: false, rejectedReason: null });
   return books.get(key);
+}
+// Помечает книгу как ОКОНЧАТЕЛЬНО отклонённую биржей (не "ещё грузится", а "никогда не загрузится") —
+// чтобы /depth мог сразу отдать настоящую причину, а не бесконечный warming_up, из-за которого
+// приходится лезть в логи Render, чтобы узнать, что на самом деле происходит.
+function markRejected(key, reason) {
+  const book = ensureBook(key);
+  book.rejectedReason = reason;
+  book.ready = false;
 }
 function applyLevels(map, levels) {
   if (!Array.isArray(levels)) return; // защита: неожиданный формат от биржи — просто пропускаем,
@@ -142,6 +150,7 @@ const bitget = {
 
 const whitebit = {
   ws: null, pingTimer: null, subscribed: new Set(), nextId: 1,
+  pendingIds: new Map(), // id -> market — чтобы связать ответ об ошибке с конкретным рынком
   connect() {
     this.ws = new WebSocket('wss://api.whitebit.com/ws');
     this.ws.on('open', () => {
@@ -154,9 +163,13 @@ const whitebit = {
       try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
       // Ответ об ОШИБКЕ подписки (JSON-RPC, например "market not found") — раньше молча
       // игнорировался, из-за чего клиент вечно ждал снапшот, который никогда не придёт
-      // ("warming_up" без конца, даже при повторных попытках).
+      // ("warming_up" без конца, даже при повторных попытках). Теперь помечаем книгу как
+      // ОКОНЧАТЕЛЬНО отклонённую — /depth сразу отдаст настоящую причину.
       if (msg.error) {
-        console.log('WhiteBIT WS: подписка отклонена —', JSON.stringify(msg.error));
+        const reason = JSON.stringify(msg.error);
+        console.log('WhiteBIT WS: подписка отклонена —', reason);
+        const market = this.pendingIds.get(msg.id);
+        if (market) markRejected(bookKey('whitebit', 'SPOT', market), reason);
         return;
       }
       if (msg.method !== 'depth_update' || !Array.isArray(msg.params)) return;
@@ -187,7 +200,9 @@ const whitebit = {
   doSubscribe(market) {
     this.subscribed.add(market);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ id: this.nextId++, method: 'depth_subscribe', params: [market, 100, '0', true] }));
+      const id = this.nextId++;
+      this.pendingIds.set(id, market);
+      this.ws.send(JSON.stringify({ id, method: 'depth_subscribe', params: [market, 100, '0', true] }));
     }
   },
   requestSymbol(symbol) {
@@ -722,8 +737,16 @@ const kraken = {
       try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
       // Ответ об ОШИБКЕ подписки (например, биржа не знает такую пару) — раньше молча игнорировался,
       // из-за чего клиент вечно ждал снапшот, который никогда не придёт ("warming_up" без конца).
+      // Теперь помечаем книгу как ОКОНЧАТЕЛЬНО отклонённую — /depth сразу отдаст настоящую причину.
       if (msg.success === false) {
-        console.log('Kraken WS: подписка отклонена —', JSON.stringify(msg.error || msg));
+        const reason = msg.error || JSON.stringify(msg);
+        console.log('Kraken WS: подписка отклонена —', reason);
+        const pairFromResult = msg.result && msg.result.symbol; // например "HYPE/USDT"
+        if (pairFromResult) {
+          const [base, quote] = pairFromResult.split('/');
+          const internalSymbol = (base === 'BTC' ? 'XBT' : base) + quote;
+          markRejected(bookKey('kraken', 'X', internalSymbol), reason);
+        }
         return;
       }
       if (msg.channel !== 'book' || !msg.data) return;
@@ -1229,10 +1252,20 @@ app.get('/depth', async (req, res) => {
 
   const key = adapter.requestSymbol(symbol, marketType);
   let book = books.get(key);
+  // Биржа явно ОТКЛОНИЛА подписку (не "ещё грузится", а "такой пары нет") — отдаём настоящую
+  // причину сразу, без ожидания. Раньше это выглядело как бесконечный warming_up, и настоящую
+  // причину приходилось смотреть в логах Render — теперь видно сразу в статусе таблицы.
+  if (book && book.rejectedReason) {
+    return res.status(400).json({ status: 'rejected', message: `Биржа отклонила пару: ${book.rejectedReason}` });
+  }
   if (!book || !book.ready) {
     // Не сдаёмся сразу — ждём немного прихода снапшота, чтобы клиенту не приходилось жать
     // "обновить" второй раз вручную ради того, что обычно занимает секунду-две.
     book = await waitForReady(key);
+  }
+  if (book && book.rejectedReason) {
+    // Отказ мог прийти уже ПОКА ждали снапшот — проверяем ещё раз после waitForReady
+    return res.status(400).json({ status: 'rejected', message: `Биржа отклонила пару: ${book.rejectedReason}` });
   }
   if (!book || !book.ready) {
     return res.status(202).json({ status: 'warming_up', message: 'Не дождался снапшота за 8 секунд, подожди ещё и запроси снова' });
