@@ -700,6 +700,12 @@ const kraken = {
     this.ws.on('message', (raw) => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      // Ответ об ОШИБКЕ подписки (например, биржа не знает такую пару) — раньше молча игнорировался,
+      // из-за чего клиент вечно ждал снапшот, который никогда не придёт ("warming_up" без конца).
+      if (msg.success === false) {
+        console.log('Kraken WS: подписка отклонена —', JSON.stringify(msg.error || msg));
+        return;
+      }
       if (msg.channel !== 'book' || !msg.data) return;
       const d = msg.data[0];
       if (!d) return;
