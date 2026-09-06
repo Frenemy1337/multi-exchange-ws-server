@@ -95,6 +95,7 @@ const bitget = {
       if (text === 'pong') { clearTimeout(this.pongTimer); return; }
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
+      if (msg.event === 'error') { console.log('Bitget WS: подписка отклонена —', JSON.stringify(msg)); return; }
       if (!msg.action || !msg.arg || msg.arg.channel !== 'books') return;
       const key = bookKey('bitget', msg.arg.instType, msg.arg.instId);
       const book = ensureBook(key);
@@ -151,6 +152,13 @@ const whitebit = {
     this.ws.on('message', (raw) => {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+      // Ответ об ОШИБКЕ подписки (JSON-RPC, например "market not found") — раньше молча
+      // игнорировался, из-за чего клиент вечно ждал снапшот, который никогда не придёт
+      // ("warming_up" без конца, даже при повторных попытках).
+      if (msg.error) {
+        console.log('WhiteBIT WS: подписка отклонена —', JSON.stringify(msg.error));
+        return;
+      }
       if (msg.method !== 'depth_update' || !Array.isArray(msg.params)) return;
       const [, updateData, market] = msg.params;
       const key = bookKey('whitebit', 'SPOT', market);
@@ -225,6 +233,13 @@ function makeBinanceAdapter(wsBase, restSnapshotUrl, marketLabel) {
       try {
         const resp = await fetch(restSnapshotUrl(symbolUpper));
         const snap = await resp.json();
+        // Биржа может ответить ошибкой (например {"code":-1121,"msg":"Invalid symbol."}) с обычным
+        // 200/400 статусом — без этой проверки код молча создал бы ПУСТОЙ стакан и пометил его
+        // "готовым", что хуже честного warming_up — выглядело бы как реальный (нулевой) результат.
+        if (snap.code !== undefined && !snap.asks && !snap.bids) {
+          console.log(`Binance ${marketLabel}: биржа отклонила символ ${symbolUpper} —`, JSON.stringify(snap));
+          return;
+        }
         const book = ensureBook(key);
         book.asks = new Map((snap.asks || []).map(([p, s]) => [p, s]));
         book.bids = new Map((snap.bids || []).map(([p, s]) => [p, s]));
@@ -321,6 +336,7 @@ const okx = {
       if (text === 'pong') return;
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
+      if (msg.event === 'error') { console.log('OKX WS: подписка отклонена —', JSON.stringify(msg)); return; }
       if (!msg.arg || msg.arg.channel !== 'books' || !msg.data) return;
       const key = bookKey('okx', 'X', msg.arg.instId);
       const book = ensureBook(key);
@@ -461,6 +477,10 @@ function makeKuCoinAdapter(tokenUrl, topicPrefix, marketLabel, snapshotFetcher, 
             console.log(`KuCoin ${marketLabel} WS: welcome получен`);
             for (const symbol of this.subscribed) this.sendSubscribe(symbol);
             this.startPing();
+            return;
+          }
+          if (msg.type === 'error') {
+            console.log(`KuCoin ${marketLabel} WS: подписка отклонена —`, JSON.stringify(msg));
             return;
           }
           if (msg.type === 'message' && msg.topic && msg.topic.startsWith(topicPrefix)) {
@@ -1085,7 +1105,15 @@ const mexc = {
       for (const symbol of this.subscribed) this.doSubscribe(symbol);
     });
     this.ws.on('message', (raw) => {
-      if (typeof raw === 'string' || raw.length < 5) return; // служебный текстовый ответ на подписку
+      if (typeof raw === 'string') {
+        // Текстовый ответ — обычно подтверждение подписки или ошибка (не бинарные данные стакана).
+        // Раньше молча игнорировался целиком — логируем, если похоже на ошибку, чтобы видеть причину.
+        if (raw.includes('"code"') && !raw.includes('"code":0')) {
+          console.log('MEXC WS: возможная ошибка подписки —', raw.slice(0, 300));
+        }
+        return;
+      }
+      if (raw.length < 5) return; // служебный короткий ответ на подписку
       let fields;
       try { fields = decodeProtobuf(raw); } catch (e) { return; }
       const symbolEntry = fields[MEXC_SYMBOL_FIELD] && fields[MEXC_SYMBOL_FIELD][0];
