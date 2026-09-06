@@ -1234,8 +1234,12 @@ function waitForReady(key, timeoutMs = 8000, intervalMs = 200) {
     const start = Date.now();
     const check = () => {
       const book = books.get(key);
-      if (book && book.ready) return resolve(book);
-      if (Date.now() - start >= timeoutMs) return resolve(null);
+      // Проверяем ОБА условия — не только "готово", но и "уже точно отклонено". Раньше отказ,
+      // пришедший ПОСЛЕ начала ожидания (а не до), просто тонул тут до конца всех 8 секунд —
+      // функция ждала "готовности", которая никогда не наступит, и в итоге пряталась настоящая
+      // причина, уже известная серверу, за бесполезным полным таймаутом.
+      if (book && (book.ready || book.rejectedReason)) return resolve(book);
+      if (Date.now() - start >= timeoutMs) return resolve(book || null);
       setTimeout(check, intervalMs);
     };
     check();
